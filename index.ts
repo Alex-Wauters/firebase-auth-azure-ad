@@ -6,6 +6,10 @@ import { isArray } from 'util';
 
 const cors = require('cors')({ origin: true });
 
+const issuerURI = "https://sts.windows.net/{TENANTID}/"; //TODO: Provide your Azure AD tenant ID here.
+const tenantName = "yourtenantname"; //TODO: Provide your tenant name here. example: companyxyz. (companyxyz.onmicrosoft.com)
+const clientId = "yourclientid"; //TODO: provide your application clientId here.
+
 // Minting a Firebase Auth token requires manual wiring of the service account
 const serviceAccount = require("../serviceAccountKey.json");
 admin.initializeApp({
@@ -28,14 +32,14 @@ exports.validateAuth = functions.https.onRequest(async (req, res) => {
             try {
                 const token = req.body.id_token;
                 const unverified: any = jwt.decode(token, { complete: true });
-                if (!unverified || !unverified.payload || unverified.payload.iss !== "https://sts.windows.net/YOUR_STS_IDENTIFIER/") { //TODO: Insert your STS GUID identifier
+                if (!unverified || !unverified.payload || unverified.payload.iss !== issuerURI) {
                     console.error(`Invalid unverified token (iss): ${token}. Unverified decoding: ${unverified}`);
                     throw new Error("Invalid issuer");
                 }
                 if (!unverified.header || unverified.header.alg !== "RS256" || !unverified.header.kid) {
                     throw new Error(`Invalid header or algorithm on token: ${token}`);
                 }
-                const k = await addSignatureKeysIfMissing();
+                const k = await getSignatureKeys();
                 const signatureKey = k.find((c => {
                     return c.kid === unverified.header.kid;
                 }));
@@ -50,8 +54,8 @@ exports.validateAuth = functions.https.onRequest(async (req, res) => {
                 res.status(400).send(`Oh oh, something went wrong. Please contact support with the following message: see the logs for more information.`);
             }
         } else {
-            console.error(`No id_token present in request body`);
-            res.status(400).send(`Oh oh, something went wrong. Please contact support with the following message: No token present in id_token attribute.`);
+            // Redirect to IdP
+            res.redirect(`https://login.microsoftonline.com/${tenantName}.onmicrosoft.com/oauth2/authorize?client_id=${clientId}&&response_type=id_token&scope=openid&nonce=42&response_mode=form_post`);
         }
     });
 });
@@ -67,21 +71,79 @@ interface MSOpenIdKey {
     issuer: string;
 }
 
-function addSignatureKeysIfMissing(): Promise<Array<MSOpenIdKey>> {
+/**
+ * Retrieve the IDP signing keys. If this container is re-used for another function invocation, they may still be in memory.
+ * If they're not in memory, keys will be retrieved from Firestore.
+ * If no keys are in firestore, they will be retrieved via HTTPS call.
+ *
+ * If you do not want to use firestore to store the signing keys, you can perform the updateIdpKeys method on each authentication request.
+ */
+async function getSignatureKeys(): Promise<Array<MSOpenIdKey>> {
     if (keys.length !== 0) {
-        return Promise.resolve(keys);
-    } else {
-        return rp({ uri: 'https://login.microsoftonline.com/common/discovery/v2.0/keys', json: true })
-            .then((data) => {
-                if (data && data.keys && isArray(data.keys) && data.keys.length > 0) {
-                    keys = data.keys;
-                    return keys;
-                } else {
-                    console.error(`Received from MS openID endpoint: ${data}`);
-                    throw new Error("Could not read the keys from MS' openID discovery endpoint");
-                }
-            })
+        return keys; // From container memory
     }
+    keys = await getKeysFromDB();
+    if (keys.length !== 0) { // Will be empty the first time.
+        return keys;
+    }
+    return await updateIdpKeys();
+}
+
+async function getKeysFromDB(): Promise<Array<MSOpenIdKey>> {
+    const result = [];
+    const querySnapshot = await db.collection("IdpKeys").get();
+    querySnapshot.forEach(function (doc) {
+        result.push(doc.data());
+    });
+    return result;
+}
+
+/**
+ * Retrieve IDP signature keys.
+ */
+async function updateIdpKeys(): Promise<Array<MSOpenIdKey>> {
+    const data = await rp({ uri: 'https://login.microsoftonline.com/common/discovery/v2.0/keys', json: true });
+    if (data && data.keys && isArray(data.keys) && data.keys.length > 0) {
+        data.keys.forEach(async (k: MSOpenIdKey) => {
+            await db.collection('IdpKeys').doc(k.kid).set(k);
+        });
+        keys = data.keys; // Store in container. Will be re-used when container is re-used
+        return keys;
+    } else {
+        console.error(`Received from MS openID endpoint: ${data}`);
+        throw new Error("Could not read the keys from MS' openID discovery endpoint");
+    }
+}
+
+/**
+ * Periodically retrieve the IDP Signature keys.
+ * Triggered by a Cloud Composer call to the daily pubsub.
+ */
+exports.updatePublicKey = functions.pubsub.topic('daily').onPublish(async event => {
+    console.log("Refreshing IdP Public keys");
+    const updatedKeys = await updateIdpKeys();
+    // Remove old signing keys
+    const toDelete = await getOldKeys(updatedKeys);
+    console.log(`${toDelete.length} keys to remove`);
+    toDelete.forEach(async k => {
+        try {
+            await db.collection("IdpKeys").doc(k).delete();
+            console.log(`Document ${k} deleted`);
+        } catch (err) {
+            console.error("Error removing document: ", err);
+        }
+    })
+});
+
+async function getOldKeys(updatedKeys: Array<MSOpenIdKey>) {
+    const querySnapshot = await db.collection("IdpKeys").get();
+    const oldKeys: string[] = [];
+    querySnapshot.forEach(doc => {
+        if (!updatedKeys.some(k => k.kid === doc.id)) {
+            oldKeys.push(doc.id);
+        }
+    });
+    return oldKeys;
 }
 
 async function verifyToken(token: string, cert: string): Promise<string> {
@@ -89,7 +151,7 @@ async function verifyToken(token: string, cert: string): Promise<string> {
         console.log(`Selected signature key: ${cert}`);
         jwt.verify(token, convertCertificate(cert), {
             algorithms: ["RS256"], // Prevent the 'none' alg from being used
-            issuer: "https://sts.windows.net/YOUR_STS_IDENTIFIER/" //TODO: Insert your STS GUID identifier
+            issuer: issuerURI
         }, function (err, decoded: any) {
             if (err || !decoded) {
                 console.error(`Could not verify token: ${err}`);

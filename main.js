@@ -24,7 +24,7 @@ firebase.auth().onAuthStateChanged(function (user) {
                     console.error(errorCode + ' ' + errorMessage);
                 });
         } else { // User not authenticated and no custom token present. Redirect to Azure AD for authentication token
-            let redirectUrl = "https://login.microsoftonline.com/YOURTENANTNAME.onmicrosoft.com/oauth2/authorize?client_id=APPCLIENTID&&response_type=id_token&scope=openid&nonce=42&response_mode=form_post"; //TODO: Replace YOURTENANTNAME and APPCLIENTID
+            let redirectUrl = "/auth"; //TODO: Redirect to the URL of your auth function
             if (window.location.port === "5000") { // Adjust the requested redirectUri for local development
                 redirectUrl = redirectUrl + "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fauth";
             }
